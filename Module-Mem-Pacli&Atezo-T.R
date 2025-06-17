@@ -62,7 +62,7 @@ pseudo_bulk<-mean_counts
 rm(mean_counts)
 rm(raw_counts)
 rm(combined)
-#----------split samples based on pre and post for construct two wgcna network
+#----------split samples based on pre and post for constructing two WGCNA network
 sample_names <- colnames(pseudo_bulk)
 
 sample_group <- ifelse(grepl("^Pre", sample_names), "pre", "post")
@@ -95,37 +95,22 @@ head(MEs_pr)
 module_names <- colnames(MEs_pr)
 module_names
 
-# انتخاب ژنهای مشترک
 genes_to_use <- intersect(gene_info, colnames(datExpr_pre))
 datExpr_pre1 <- datExpr_pre[, genes_to_use]
-
-# پیدا کردن نمونه‌های مشترک بین بیان ژن و eigengenes
 common_samples <- intersect(rownames(MEs_pr), rownames(datExpr_pre1))
 MEs_mat <- MEs_pr[common_samples, ]
 expr_mat <- datExpr_pre1[common_samples, ]
-
-# محاسبه module membership (kME)
 module_membership <- cor(expr_mat, MEs_mat, use = "pairwise.complete.obs")
 
-# ذخیره خروجی
 write.csv(module_membership, file = "D:\\Thesis\\Proposal\\Analysis\\WGCNA\\Tumor-Patient\\Tumor-Patient-Pacli&Atizo-Analysis\\Results\\ModuleMembership_NewData.csv")
-# اعمال بردار importance (ضرب هر سطر در مقدار importance مربوطه)
-# فرض: module_importance یک بردار به طول nrow(cor_matrix)
 weighted_cor_matrix <- module_membership * module_importance  # ضرب سطری به صورت برداری در R
 weighted_cor_matrix
-# ذخیره نسخه وزن‌دار
 write.csv(weighted_cor_matrix, file = "D:\\Thesis\\Proposal\\Analysis\\WGCNA\\Tumor-Patient\\Tumor-Patient-Pacli&Atizo-Analysis\\Results\\Weighted_ModuleCorrelation_Pre_vs_Post.csv")
-
-# فرض: weighted_cor_matrix موجوده و ردیف‌ها اسم ژن‌هان
 max_membership_per_gene <- apply(weighted_cor_matrix, 1, max)
-
-# ساخت دیتافریم خروجی
 max_membership_df <- data.frame(
   gene = rownames(weighted_cor_matrix),
   Max_Membership = max_membership_per_gene
 )
-
-# ذخیره فایل سوم
 write.csv(max_membership_df, file = "D:\\Thesis\\Proposal\\Analysis\\WGCNA\\Tumor-Patient\\Tumor-Patient-Pacli&Atizo-Analysis\\Results\\Max_Module_Membership_Per_Gene.csv", row.names = FALSE)
 
 
