@@ -1,0 +1,351 @@
+# 1.  Accuracy & Model
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras import backend as K
+
+from xgboost import XGBClassifier
+
+# 📁 مسیر ذخیره‌سازی
+output_dir = "/content/drive/MyDrive/GXB_MLP_Improved"
+os.makedirs(output_dir, exist_ok=True)
+
+# 📄 بارگذاری داده
+df = pd.read_csv(f"{output_dir}/data_top80-200f.csv")
+X = df.drop(columns=["Label"]).values
+y = (df["Label"] == "progressive").astype(int).values
+feature_names = df.drop(columns=["Label"]).columns
+
+# ⚖️ نرمال‌سازی
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# 🎯 focal loss
+def focal_loss(gamma=2., alpha=0.25):
+    def loss(y_true, y_pred):
+        y_pred = K.clip(y_pred, K.epsilon(), 1. - K.epsilon())
+        cross_entropy = -y_true * K.log(y_pred) - (1 - y_true) * K.log(1 - y_pred)
+        weight = alpha * K.pow(1 - y_pred, gamma) * y_true + \
+                 (1 - alpha) * K.pow(y_pred, gamma) * (1 - y_true)
+        return K.mean(weight * cross_entropy)
+    return loss
+
+# تابع بهترین آستانه
+def best_threshold(y_true, y_prob):
+    thresholds = np.arange(0.1, 0.9, 0.01)
+    accs = [accuracy_score(y_true, y_prob > t) for t in thresholds]
+    best_idx = np.argmax(accs)
+    return thresholds[best_idx], accs[best_idx]
+
+# 🔁 Cross-validation
+kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+mlp_auc, mlp_acc, xgb_auc, xgb_acc, combined_accs = [], [], [], [], []
+best_auc_mlp, best_auc_xgb = 0, 0
+best_model_mlp, best_model_xgb = None, None
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled, y), 1):
+    print(f"\n🔁 Fold {fold}")
+    X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    # ⚖️ وزن کلاس‌ها
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weight_dict = dict(enumerate(class_weights))
+
+    # ✅ مدل MLP بهینه‌شده
+    K.clear_session()
+    model = Sequential([
+        Input(shape=(X.shape[1],)),
+        Dense(512, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.3),
+        Dense(256, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.3),
+        Dense(128, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.2),
+        Dense(64, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss=focal_loss(), metrics=['accuracy'])
+
+    es = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=0)
+    lr_reducer = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+
+    model.fit(X_train, y_train, epochs=100, batch_size=32, validation_split=0.2,
+              verbose=0, callbacks=[es, lr_reducer], class_weight=class_weight_dict)
+
+    # پیش‌بینی MLP
+    y_prob_mlp = model.predict(X_test).ravel()
+    best_thresh, best_acc = best_threshold(y_test, y_prob_mlp)
+    y_pred_mlp = (y_prob_mlp > best_thresh).astype(int)
+
+    auc_mlp = roc_auc_score(y_test, y_prob_mlp)
+    mlp_auc.append(auc_mlp)
+    mlp_acc.append(best_acc)
+
+    if auc_mlp > best_auc_mlp:
+        best_auc_mlp = auc_mlp
+        best_model_mlp = model
+
+    # ✅ XGBoost بهینه‌شده
+    pos_weight = class_weight_dict[1] / class_weight_dict[0]
+    xgb = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.03,
+                        scale_pos_weight=pos_weight, subsample=0.8, colsample_bytree=0.8,
+                        use_label_encoder=False, eval_metric='logloss')
+    xgb.fit(X_train, y_train)
+    y_prob_xgb = xgb.predict_proba(X_test)[:, 1]
+    y_pred_xgb = xgb.predict(X_test)
+
+    auc_xgb = roc_auc_score(y_test, y_prob_xgb)
+    acc_xgb = accuracy_score(y_test, y_pred_xgb)
+    xgb_auc.append(auc_xgb)
+    xgb_acc.append(acc_xgb)
+
+    if auc_xgb > best_auc_xgb:
+        best_auc_xgb = auc_xgb
+        best_model_xgb = xgb
+
+    # ✅ ترکیب مدل‌ها (Ensemble)
+    combined_prob = 0.6 * y_prob_mlp + 0.4 * y_prob_xgb
+    combined_pred = (combined_prob > best_thresh).astype(int)
+    combined_acc = accuracy_score(y_test, combined_pred)
+    combined_accs.append(combined_acc)
+    print(f"✅ Combined Accuracy: {combined_acc:.4f}")
+
+# 💾 ذخیره مدل‌ها
+best_model_mlp.save(f"{output_dir}/best_mlp_model.h5")
+joblib.dump(best_model_xgb, f"{output_dir}/best_xgb_model.pkl")
+joblib.dump(scaler, f"{output_dir}/scaler.pkl")
+
+# 📊 نتایج
+results_df = pd.DataFrame({
+    "Fold": list(range(1, 6)),
+    "MLP AUC": mlp_auc,
+    "MLP Accuracy": mlp_acc,
+    "XGBoost AUC": xgb_auc,
+    "XGBoost Accuracy": xgb_acc,
+    "Combined Accuracy": combined_accs
+})
+results_df.loc["Mean"] = ["Mean",
+                          np.mean(mlp_auc),
+                          np.mean(mlp_acc),
+                          np.mean(xgb_auc),
+                          np.mean(xgb_acc),
+                          np.mean(combined_accs)]
+results_df.to_csv(f"{output_dir}/fold_comparison_improved.csv", index=False)
+
+# 📈 نمودار AUC
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, 6), mlp_auc, marker='o', label='MLP AUC')
+plt.plot(range(1, 6), xgb_auc, marker='s', label='XGBoost AUC')
+plt.xlabel("Fold")
+plt.ylabel("AUC")
+plt.title("AUC per Fold")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(f"{output_dir}/auc_per_fold_improved.png", dpi=300)
+plt.show()
+# 2.  MLP model - LIME
+
+!pip install lime --quiet
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from lime import lime_tabular
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+import joblib
+from IPython.display import display, HTML
+from tensorflow.keras.models import load_model
+from tensorflow.keras import backend as K
+
+# 📁 مسیر ذخیره
+output_dir = "/content/drive/MyDrive/GXB_MLP_Improved/LIME"
+os.makedirs(output_dir, exist_ok=True)
+
+# 1️⃣ بارگذاری داده‌ها و مدل
+df = pd.read_csv("/content/drive/MyDrive/GXB_MLP_Improved/data_top80-200f.csv")
+X = df.drop(columns=["Label"]).values
+y = (df["Label"] == "progressive").astype(int).values
+feature_names = df.drop(columns=["Label"]).columns.tolist()
+
+def focal_loss(gamma=2., alpha=0.25):
+    # تعریف تابع focal_loss
+    def loss(y_true, y_pred):
+        y_pred = K.clip(y_pred, K.epsilon(), 1. - K.epsilon())
+        cross_entropy = -y_true * K.log(y_pred) - (1 - y_true) * K.log(1 - y_pred)
+        weight = alpha * K.pow(1 - y_pred, gamma) * y_true + \
+                 (1 - alpha) * K.pow(y_pred, gamma) * (1 - y_true)
+        return K.mean(weight * cross_entropy)
+    return loss
+
+model = load_model("/content/drive/MyDrive/GXB_MLP_Improved/best_mlp_model.h5", custom_objects={'loss': focal_loss()})
+!cp "/content/drive/MyDrive/GXB_MLP_Improved/scaler.pkl" "/content/drive/MyDrive/GXB_MLP_Improved/LIME/scaler.pkl"
+
+scaler = joblib.load(f"{output_dir}/scaler.pkl")
+X_scaled = scaler.transform(X)
+
+# 2️⃣ تابع پیش‌بینی برای LIME
+def keras_predict_fn(x):
+    probs = model.predict(x)
+    return np.hstack((1 - probs, probs))
+
+# 3️⃣ ساخت LIME Explainer با random_state برای خروجی پایدار
+explainer = lime_tabular.LimeTabularExplainer(
+    training_data=X_scaled,
+    feature_names=feature_names,
+    class_names=["non-progressive", "progressive"],
+    mode='classification',
+    discretize_continuous=True,
+    random_state=42  # ✅ ثبات خروجی در هر اجرا
+)
+
+# 4️⃣ ذخیره و نمایش نمونه‌های 0 تا 5 (PNG و HTML)
+for i in range(6):
+    exp = explainer.explain_instance(X_scaled[i], keras_predict_fn, num_features=10)
+
+    # 📷 تصویر PNG تمیز
+    fig = exp.as_pyplot_figure(label=1)
+    fig.set_size_inches(10, 4.5)
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
+    plt.tight_layout()
+    fig.patch.set_facecolor('white')
+    fig.savefig(f"{output_dir}/lime_mlp_sample{i}_clean.png", dpi=600, bbox_inches='tight')
+    plt.close()
+
+    # 🌐 ذخیره HTML تعاملی
+    html_path = f"{output_dir}/lime_mlp_sample{i}.html"
+    exp.save_to_file(html_path)
+
+    # 🖥 نمایش در نوت‌بوک
+    with open(html_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+    display(HTML(f"<h4>📊 Sample {i}</h4>{html_content}"))
+
+print("✅ تمام خروجی‌های LIME (PNG + HTML) ذخیره و نمایش داده شدند.")
+
+# 5️⃣ محاسبه Permutation Importance → استخراج 20 ژن برتر
+def permutation_importance(model, X, y, metric=roc_auc_score, n_repeats=5):
+    base_score = metric(y, model.predict(X).ravel())
+    importances = []
+    for i in range(X.shape[1]):
+        scores = []
+        for _ in range(n_repeats):
+            X_perm = X.copy()
+            np.random.shuffle(X_perm[:, i])
+            score = metric(y, model.predict(X_perm).ravel())
+            scores.append(base_score - score)
+        importances.append(np.mean(scores))
+    return np.array(importances)
+
+mlp_importances = permutation_importance(model, X_scaled, y)
+top20_idx = np.argsort(mlp_importances)[::-1][:20]
+
+top20_df = pd.DataFrame({
+    "Gene": [feature_names[i] for i in top20_idx],
+    "Importance": mlp_importances[top20_idx]
+})
+top20_df.to_csv(f"{output_dir}/top20_mlp_genes.csv", index=False)
+
+print("\n✅ Top 20 ژن مهم بر اساس LIME ذخیره شد:")
+display(top20_df)
+# 3.  GXB model - SHAP
+
+import warnings
+warnings.filterwarnings("ignore")
+import shap
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import joblib
+import os
+output_dir = "/content/drive/MyDrive/GXB_MLP_Improved/SHAP"
+os.makedirs(output_dir, exist_ok=True)
+df = pd.read_csv("/content/drive/MyDrive/GXB_MLP_Improved/data_top80-200f.csv")
+xgb_model = joblib.load("/content/drive/MyDrive/GXB_MLP_Improved/best_xgb_model.pkl")
+X = df.drop(columns=["Label"]).values
+feature_names = df.drop(columns=["Label"]).columns.tolist()
+!cp "/content/drive/MyDrive/GXB_MLP_Improved/scaler.pkl" "/content/drive/MyDrive/GXB_MLP_Improved/SHAP/scaler.pkl"
+scaler = joblib.load(f"{output_dir}/scaler.pkl")
+X_scaled = scaler.transform(X)
+explainer = shap.Explainer(xgb_model)
+shap_values = explainer(X_scaled)
+mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
+top20_idx = np.argsort(mean_abs_shap)[::-1][:20]
+top20_names = [feature_names[i] for i in top20_idx]
+
+top20_df = pd.DataFrame({
+    "Gene": top20_names,
+    "SHAP Importance": mean_abs_shap[top20_idx]
+})
+top20_df.to_csv(f"{output_dir}/top20_xgb_genes.csv", index=False)
+print("✅ Top 20 ژن SHAP ذخیره شد:\n", top20_df)
+X_top20 = X_scaled[:, top20_idx]
+shap_top20 = shap_values[:, top20_idx]
+
+plot_types = {
+    "bar": "shap_summary_bar.png",
+    "violin": "shap_summary_violin.png",
+    "dot": "shap_summary_beeswarm.png"
+}
+
+for ptype, fname in plot_types.items():
+    plt.figure()
+    shap.summary_plot(shap_top20, X_top20, feature_names=top20_names, plot_type=ptype, show=False)
+    ax = plt.gca()
+    ax.set_ylabel("")  # حذف عنوان محور Y
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/{fname}", dpi=600, bbox_inches='tight')
+    plt.close()
+    print(f"📁 ذخیره شد: {fname}")
+for sample_index in range(3):
+    sample_shap = shap_values[sample_index]
+    top20_values = sample_shap.values[top20_idx]
+    top20_data = sample_shap.data[top20_idx]
+
+    top20_sample = shap.Explanation(
+        values=top20_values,
+        base_values=sample_shap.base_values,
+        data=top20_data,
+        feature_names=top20_names
+    )
+    shap.plots.waterfall(top20_sample, max_display=20, show=False)
+    plt.savefig(f"{output_dir}/shap_waterfall_sample{sample_index}_top20.png", dpi=600, bbox_inches='tight')
+    plt.close()
+    print(f"📁 ذخیره شد: shap_waterfall_sample{sample_index}_top20.png")
+
+# 4. SHAP and LIME Importance Table to find the common genes
+import pandas as pd
+output_dir = "/content/drive/MyDrive/GXB_MLP_Improved/SHAP and LIME Importance Table to find the common genes"
+mlp_genes = pd.read_csv("/content/drive/MyDrive/GXB_MLP_Improved/LIME/top20_mlp_genes.csv")  # LIME (MLP)
+xgb_genes = pd.read_csv("/content/drive/MyDrive/GXB_MLP_Improved/SHAP/top20_xgb_genes.csv")  # SHAP (XGBoost)
+shared = pd.merge(mlp_genes, xgb_genes, on="Gene", how="inner")
+shared_sorted = shared.sort_values(by=["Importance", "SHAP Importance"], ascending=False)
+csv_path = f"{output_dir}/shared_genes_LIME_SHAP_sorted.csv"
+xlsx_path = f"{output_dir}/shared_genes_LIME_SHAP_sorted.xlsx"
+shared_sorted.to_csv(csv_path, index=False)
+shared_sorted.to_excel(xlsx_path, index=False)
+print("✅ جدول نهایی ژن‌های همپوشان (LIME + SHAP) به ترتیب اهمیت:\n")
+print(shared_sorted)
+
+print(f"\n📁 ذخیره شد در:\n- CSV: {csv_path}\n- Excel: {xlsx_path}")
