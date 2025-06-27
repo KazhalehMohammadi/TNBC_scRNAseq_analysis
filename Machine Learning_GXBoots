@@ -1,0 +1,845 @@
+library(Seurat)
+library(dplyr)
+library(readr)
+library(e1071)
+library(caret)
+library(rpart) 
+library(ggplot2)
+library(rpart.plot)
+library(iml)
+library(data.table)
+library(ggpubr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(httr)
+library(jsonlite)
+library(readxl)
+library(janitor)
+library(reshape2)
+library(randomForest)
+library(reshape2)
+library(xgboost)
+library(Matrix)
+library(openxlsx)
+library(DALEX)
+library(MLmetrics)
+# ===============================================================
+
+file_path <- "D:\\Thesis\\Proposal\\Analysis\\TOP-BIOMARKERS\\Results\\Top200_Biomarkers_WeightedScore.csv"
+data <- read.csv(file_path, header = TRUE)
+d <- data$gene
+
+data_dir <- "D:/Thesis/Proposal/Thesis_Data/GSE169246/files"
+
+names <- c("Pre_P001_b","Pre_P002_b","Pre_P002_t", "Pre_P004_b", "Pre_P004_t", "Pre_P005_b", 
+           "Pre_P005_t", "Pre_P007_b", "Pre_P007_t", "Pre_P008_b", "Pre_P010_b", "Pre_P011_b", 
+           "Pre_P013_b","Pre_P013_t", "Pre_P016_b", "Pre_P016_t" 
+)  
+
+sample_dirs <- list.dirs(data_dir, recursive = TRUE, full.names = TRUE)
+sample_dirs <- sample_dirs[basename(sample_dirs) %in% names]
+
+seurat_list <- list()
+for (dir in sample_dirs) {
+  sample_name <- basename(dir)
+  counts <- Read10X(data.dir = dir)
+  colnames(counts) <- paste(sample_name, colnames(counts), sep = "-")
+  seurat_obj <- CreateSeuratObject(counts = counts, project = sample_name)
+  seurat_list[[sample_name]] <- seurat_obj@assays$RNA@counts
+}
+
+combined_counts <- do.call(cbind, seurat_list)
+filtered_counts <- combined_counts[rownames(combined_counts) %in% d, ]
+
+saveRDS(filtered_counts, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/filtered_counts_matrix.rds")
+filtered_counts <- readRDS("D:/Thesis/Proposal/Analysis/Machine Learning/Results/filtered_counts_matrix.rds")
+
+cell_names <- colnames(combined_counts)
+sample_ids <- sapply(strsplit(cell_names, "-"), `[`, 1)
+unique_samples <- unique(sample_ids)
+cell_labels <- data.frame(Cell = character(), Label = character(), stringsAsFactors = FALSE)
+
+valid_labels <- c("progressive", "non-progressive")
+for (sample in unique_samples) {
+  repeat {
+    label <- readline(prompt = paste0("Enter label for sample '", sample, "' (progressive / non-progressive): "))
+    label <- trimws(tolower(label))  # پاک‌سازی فاصله و تبدیل به حروف کوچک
+    if (label %in% valid_labels) break
+    cat("⛔ Invalid input. Please enter only 'progressive' or 'non-progressive'.\n")
+  }
+  cells <- cell_names[sample_ids == sample]
+  sample_df <- data.frame(Cell = cells, Label = label, stringsAsFactors = FALSE)
+  cell_labels <- rbind(cell_labels, sample_df)
+}
+
+saveRDS(cell_labels,
+        "D:/Thesis/Proposal/Analysis/Machine Learning/Results/cell_labels.rds")
+cell_labels <- readRDS("D:/Thesis/Proposal/Analysis/Machine Learning/Results/cell_labels.rds")
+
+write.csv(cell_labels, "D:\\Thesis\\Proposal\\Analysis\\Machine Learning\\Results\\cell_labels.csv", row.names = FALSE)
+fwrite(cell_labels,
+       file = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/cell_labels_fast.csv",
+       row.names = FALSE)
+
+# =========================================================== XGBoost
+filtered_counts <- readRDS("D:/Thesis/Proposal/Analysis/Machine Learning/Results/filtered_counts_matrix.rds")
+cell_labels <- readRDS("D:/Thesis/Proposal/Analysis/Machine Learning/Results/cell_labels.rds")
+
+# مرحله ۲: اطمینان از یکسان بودن سلول‌ها
+common_cells <- intersect(colnames(filtered_counts), cell_labels$Cell)
+filtered_counts <- filtered_counts[, common_cells]
+cell_labels <- cell_labels[cell_labels$Cell %in% common_cells, ]
+
+# مرحله ۳: ساخت دیتافریم نهایی برای ML
+df <- as.data.frame(t(as.matrix(filtered_counts)))  # ترانهاده چون سلول‌ها باید ردیف باشند
+df$Cell <- rownames(df)
+df <- merge(df, cell_labels, by = "Cell")
+
+# مرحله ۴: آماده‌سازی داده برای XGBoost
+X_all <- df[, !(names(df) %in% c("Cell", "Label"))]
+y_all <- gsub("-", "_", y_all)
+
+# اگر نیاز به پیش‌پردازش هست (استانداردسازی)
+preProc_all <- preProcess(X_all, method = c("center", "scale"))
+X_all_scaled <- predict(preProc_all, X_all)
+
+# ساخت دیتافریم نهایی برای مدل
+model_data <- data.frame(X_all_scaled, Label = factor(y_all, levels = c("non_progressive", "progressive")))
+
+# نمایش خلاصه‌ای از داده
+print(dim(model_data))
+print(table(model_data$Label))
+# کنترل آموزش با summary شخصی
+set.seed(123)
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = my_summary,
+  savePredictions = "final",
+  verboseIter = TRUE
+)
+
+# گرید پارامترها
+xgb_grid <- expand.grid(
+  nrounds = 200,
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.05, 0.1),
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+# آموزش مدل
+xgb_model <- train(
+  Label ~ .,
+  data = model_data,
+  method = "xgbTree",
+  trControl = train_control,
+  tuneGrid = xgb_grid,
+  metric = "ROC"
+)
+
+# ذخیره مدل و نتایج
+saveRDS(xgb_model, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_cv200f.rds")
+write.csv(xgb_model$results, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_cv200f.csv", row.names = FALSE)
+
+
+best_idx <- which.max(xgb_model$results$ROC.ROC)
+best_row <- xgb_model$results[best_idx, ]
+
+sink("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_best_model_summary.txt")
+
+cat("========== XGBoost Best Model Summary ==========\n\n")
+
+cat("🏆 Best Hyperparameters:\n")
+print(xgb_model$bestTune)
+
+cat(sprintf("\n📈 Best ROC AUC: %.2f%%\n", best_row$ROC.ROC * 100))
+cat(sprintf("🎯 Sensitivity: %.2f%%\n", best_row$Sens.Sens * 100))
+cat(sprintf("🛡️ Specificity: %.2f%%\n", best_row$Spec.Spec * 100))
+cat(sprintf("✅ Accuracy: %.2f%%\n", best_row$Accuracy * 100))
+
+sink()
+
+
+# ویژگی‌های مهم
+importance <- varImp(xgb_model, scale = FALSE)
+top_features <- importance$importance
+top_features <- top_features[order(-top_features$Overall), , drop = FALSE]
+write.csv(top_features, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_feature_importance200f.csv")
+
+# نمودار 20 ویژگی برتر
+png("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_feature_importance_plot200f.png", width = 800, height = 600)
+imp_df <- data.frame(Feature = rownames(top_features), Importance = top_features$Overall)
+top_n <- head(imp_df, 20)
+ggplot(top_n, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Important Features in XGBoost", x = "Feature", y = "Importance") +
+  theme_minimal()
+dev.off()
+
+# ذخیره فایل‌های خروجی با لیبل
+top_features$Gene <- rownames(top_features)
+save_gene_subset <- function(gene_list, filename) {
+  df_subset <- model_data[, c(gene_list, "Label")]
+  write.csv(df_subset, file = filename, row.names = FALSE)
+}
+
+top20 <- head(top_features$Gene, 20)
+top50 <- head(top_features$Gene, 50)
+top60 <- head(top_features$Gene, 60)
+top70 <- head(top_features$Gene, 70)
+top80 <- head(top_features$Gene, 80)
+
+save_gene_subset(top20, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/data_top20-200f.csv")
+save_gene_subset(top50, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/data_top50-200f.csv")
+save_gene_subset(top60, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/data_top60-200f.csv")
+save_gene_subset(top70, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/data_top70-200f.csv")
+save_gene_subset(top80, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/data_top80-200f.csv")
+
+# ذخیره initial 200
+d_mapped <- make.names(d)
+initial200 <- model_data[, c(intersect(d_mapped, colnames(model_data)), "Label")]
+write.csv(initial200, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/data_initial_200.csv", row.names = FALSE)
+
+# ========================================= XGBoost: اتصال Top 20 ژن به کلاسترها
+library(openxlsx)
+
+top20_xgb <- head(top_features, 20)
+top20_xgb$Feature <- rownames(top20_xgb)
+
+write.xlsx(
+  top20_xgb,
+  file = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_features.xlsx",
+  rowNames = FALSE
+)
+top20_xgb <- head(top_features, 20)
+top20_xgb$Feature <- rownames(top20_xgb)
+top20_xgb <- top20_xgb[, c("Feature", "Overall")]
+colnames(top20_xgb)[2] <- "Importance"
+
+write.xlsx(
+  top20_xgb,
+  file = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_features.xlsx",
+  rowNames = FALSE
+)
+
+top20_xgb <- read.xlsx("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_features.xlsx")
+top20_xgb$Gene_lower <- tolower(top20_xgb$Feature)
+biomarker_data <- read.csv("D:/Thesis/Proposal/Analysis/TOP-BIOMARKERS/Results/Top200_Biomarkers_WeightedScore.csv")
+biomarker_data$gene_lower <- tolower(biomarker_data$gene)
+
+top20_with_cluster_xgb <- merge(
+  top20_xgb,
+  biomarker_data,
+  by.x = "Gene_lower",
+  by.y = "gene_lower"
+)
+write.csv(top20_with_cluster_xgb,
+          "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_gene_with_cluster_info_xgb.csv",
+          row.names = FALSE)
+
+cluster_importance_xgb <- top20_with_cluster_xgb %>%
+  dplyr::group_by(cluster_id) %>%
+  dplyr::summarise(
+    n_genes = dplyr::n(),
+    total_importance = sum(Importance),
+    mean_importance = mean(Importance),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(total_importance))
+
+p_xgb <- ggplot(cluster_importance_xgb, aes(x = reorder(cluster_id, total_importance), y = total_importance, fill = cluster_id)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Total Importance by Cluster (Top 20 Genes - XGBoost)",
+       x = "Cluster", y = "Total Importance") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+ggsave("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_cluster_total_importance_xgb_top20.png",
+       plot = p_xgb, width = 10, height = 6, dpi = 300)
+print(p_xgb)
+
+# ============================= XGBoost: KEGG & GO Enrichment
+top20_xgb <- read.xlsx("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_features.xlsx")
+
+# استخراج ژن‌ها و نگاشت به Entrez ID
+gene_symbols <- unique(top20_xgb$Feature)
+entrez_ids <- bitr(
+  gene_symbols,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+if (nrow(entrez_ids) == 0) {
+  stop("❌ هیچ ژنی به Entrez ID نگاشت نشد.")
+}
+
+# انجام تحلیل غنی‌سازی GO
+go_enrich <- enrichGO(
+  gene = entrez_ids$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+kegg_enrich <- enrichKEGG(
+  gene = entrez_ids$ENTREZID,
+  organism = "hsa",
+  pvalueCutoff = 0.05
+)
+
+# تبدیل به readable برای نمایش اسم ژن‌ها
+kegg_enrich <- setReadable(kegg_enrich, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+
+
+p_kegg <- cnetplot(
+  kegg_enrich,
+  showCategory = 10,
+  circular = FALSE,
+  color.params = list(edge = TRUE)
+)
+
+ggsave(
+  filename = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_KEGG_network_plot_top20.png",
+  plot = p_kegg,
+  width = 12, height = 9, dpi = 300, bg = "white"
+)
+
+print(p_go)
+print(p_kegg)
+
+# ========================================== Identify drug-gene interactions
+top20 <- read_csv("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_gene_with_cluster_info_xgb.csv")
+genes <- top20$Gene
+safe_extract_interactions <- function(gene_row) {
+  interactions_df <- gene_row$interactions[[1]]
+  
+  if (is.null(interactions_df) || length(interactions_df) == 0 || 
+      (is.atomic(interactions_df) && is.na(interactions_df))) {
+    message(sprintf("No interactions found for gene: %s", gene_row$name))
+    return(NULL)
+  }
+  if (!is.data.frame(interactions_df)) {
+    message(sprintf("Interactions is not a data.frame for gene: %s", gene_row$name))
+    return(NULL)
+  }
+  
+  dfs <- lapply(seq_len(nrow(interactions_df)), function(i) {
+    inter <- interactions_df[i, ]
+    
+    tryCatch({
+      interactionTypes_text <- if (!is.null(inter$interactionTypes[[1]])) {
+        paste(inter$interactionTypes[[1]]$type, collapse = ";")
+      } else { NA }
+      
+      directionality_text <- if (!is.null(inter$interactionTypes[[1]])) {
+        paste(inter$interactionTypes[[1]]$directionality, collapse = ";")
+      } else { NA }
+      
+      attributes_text <- if (!is.null(inter$interactionAttributes[[1]])) {
+        paste(paste(inter$interactionAttributes[[1]]$name,
+                    inter$interactionAttributes[[1]]$value,
+                    sep = ":"), collapse = ";")
+      } else { NA }
+      
+      pmids_text <- if (!is.null(inter$publications[[1]])) {
+        paste(inter$publications[[1]]$pmid, collapse = ";")
+      } else { NA }
+      
+      sources_text <- if (!is.null(inter$sources[[1]])) {
+        paste(inter$sources[[1]]$sourceDbName, collapse = ";")
+      } else { NA }
+      
+      data.frame(
+        geneName = gene_row$name,
+        drugName = inter$drug.name %||% NA,
+        conceptId = inter$drug.conceptId %||% NA,
+        interactionScore = inter$interactionScore,
+        interactionTypes = interactionTypes_text,
+        directionality = directionality_text,
+        attributes = attributes_text,
+        pmids = pmids_text,
+        sources = sources_text,
+        stringsAsFactors = FALSE
+      )
+    }, error = function(e) {
+      message(sprintf("❌ Error in gene %s (interaction %d): %s", gene_row$name, i, e$message))
+      NULL
+    })
+  })
+  
+  dfs <- Filter(Negate(is.null), dfs)
+  if (length(dfs) == 0) return(NULL)
+  
+  do.call(rbind, dfs)
+}
+
+# ==== اجرای درخواست GraphQL و استخراج نتایج
+all_results <- list()
+for (gene in genes) {
+  cat("🔎 Processing gene:", gene, "\n")
+  
+  query <- sprintf('
+    {
+      genes(names: ["%s"]) {
+        nodes {
+          name
+          interactions {
+            drug {
+              name
+              conceptId
+            }
+            interactionScore
+            interactionTypes {
+              type
+              directionality
+            }
+            interactionAttributes {
+              name
+              value
+            }
+            publications {
+              pmid
+            }
+            sources {
+              sourceDbName
+            }
+          }
+        }
+      }
+    }
+  ', gene)
+  
+  res <- POST(
+    url = "https://dgidb.org/api/graphql",
+    body = list(query = query),
+    encode = "json",
+    accept_json()
+  )
+  
+  if (status_code(res) == 200) {
+    parsed <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+    nodes <- parsed$data$genes$nodes
+    
+    if (length(nodes) > 0) {
+      df <- safe_extract_interactions(nodes[1, ])
+      if (!is.null(df)) {
+        all_results[[gene]] <- df
+      }
+    } else {
+      message(sprintf("❗ No interactions found for gene: %s", gene))
+    }
+  } else {
+    message(sprintf("❌ Request failed for gene: %s | Status code: %d", gene, status_code(res)))
+  }
+}
+
+if (length(all_results) > 0) {
+  final_df <- do.call(rbind, all_results)
+  out_path <- "D:/Thesis/Proposal/Analysis/Machine Learning/DGIdb/xgboost_DGIdb_interactions_top20.csv"
+  write.csv(final_df, out_path, row.names = FALSE)
+  cat("✅ Interactions saved to:\n", out_path, "\n")
+  print(head(final_df))
+} else {
+  message("⚠️ No drug-gene interactions found for any gene.")
+}
+
+# -------------------- DRUG INTERACTION 
+
+top20_genes <- read_csv("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_gene_with_cluster_info_xgb.csv")
+paclitaxel <- read_tsv("D:/Thesis/Proposal/Analysis/Machine Learning/DGIdb/Paclitaxel-interaction-Genes.tsv")
+atezo_interaction <- read_tsv("D:/Thesis/Proposal/Analysis/Machine Learning/DGIdb/Atezozolimab-interaction-Genes.tsv")
+atezo_pacli <- read_tsv("D:/Thesis/Proposal/Analysis/Machine Learning/DGIdb/Atezozolimab&Paclitaxel-interaction-Genes.tsv")
+top20_gene_names <- top20_genes$Feature
+combined_drugs <- bind_rows(paclitaxel, atezo_interaction, atezo_pacli) %>%
+  distinct()
+filtered_combined <- combined_drugs %>%
+  filter(gene %in% top20_gene_names)
+write_csv(filtered_combined, "D:/Thesis/Proposal/Analysis/Machine Learning/DGIdb/xgboost_filtered_gene_drug_interactions_top20_RF.csv")
+
+cat("✅ File saved successfully at: filtered_gene_drug_interactions_top20_RF.csv\n")
+
+# ============================ XGBoost_PharmGKB
+
+input_zip_files <- c(
+  "D:/Thesis/Proposal/Analysis/Machine Learning/PHARMGKB/clinicalAnnotations.zip",
+  "D:/Thesis/Proposal/Analysis/Machine Learning/PHARMGKB/clinicalAnnotations_LOE1-2.zip",
+  "D:/Thesis/Proposal/Analysis/Machine Learning/PHARMGKB/pathways-tsv.zip",
+  "D:/Thesis/Proposal/Analysis/Machine Learning/PHARMGKB/relationships.zip"
+)
+for (zip_file in input_zip_files) {
+  cat("📦 Files in:", zip_file, "\n")
+  files_in_zip <- unzip(zip_file, list = TRUE)
+  print(files_in_zip$Name)
+  cat("\n")
+}
+top20_file <- "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_gene_with_cluster_info_xgb.csv"
+top20_data <- fread(top20_file)
+top_genes <- unique(top20_data$gene)  
+zip_clinical <- "D:/Thesis/Proposal/Analysis/Machine Learning/PHARMGKB/clinicalAnnotations.zip"
+zip_relationships <- "D:/Thesis/Proposal/Analysis/Machine Learning/PHARMGKB/relationships.zip"
+temp_dir <- tempdir()
+
+unzip(zip_clinical, files = "clinical_annotations.tsv", exdir = temp_dir)
+clinical_data <- fread(file.path(temp_dir, "clinical_annotations.tsv"))
+
+unzip(zip_relationships, files = "relationships.tsv", exdir = temp_dir)
+relationships_data <- fread(file.path(temp_dir, "relationships.tsv"))
+filtered_clinical <- clinical_data[Gene %in% top_genes]
+filtered_relationships <- relationships_data[
+  Entity1_name %in% top_genes | Entity2_name %in% top_genes
+]
+output_dir <- "D:/Thesis/Proposal/Analysis/Machine Learning/PHARMGKB"
+fwrite(filtered_clinical, file.path(output_dir, "filtered_clinical_annotations_top20.csv"))
+fwrite(filtered_relationships, file.path(output_dir, "filtered_relationships_top20.csv"))
+
+cat("✅ Filtered PHARMGKB results saved successfully for Top20 XGBoost genes.\n")
+
+# =================================== مقایسه بیان این ژنها در شرایط مختلف
+
+base_path <- "D:/Thesis/Proposal/Analysis/Machine Learning/Expression Matrix Gene"
+file_blood_pac   <- file.path(base_path, "Blood-Patient-Paclitaxel-Analysis.csv")
+file_blood_combo <- file.path(base_path, "Blood-Patient-Paclitaxel-Paclitaxel plus atezolizumab-Analysis.csv")
+file_tumor_pac   <- file.path(base_path, "Tumor-Patient-Paclitaxel-Analysis.csv")
+file_tumor_combo <- file.path(base_path, "Tumor-Patient-Paclitaxel-plus-atezolizumab-Analysis.csv")
+file_top20       <- "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/xgboost_top20_gene_with_cluster_info_xgb.csv"
+top20        <- read_csv(file_top20)
+blood_pac    <- read_csv(file_blood_pac)
+blood_combo  <- read_csv(file_blood_combo)
+tumor_pac    <- read_csv(file_tumor_pac)
+tumor_combo  <- read_csv(file_tumor_combo)
+top_genes <- toupper(top20$Feature)
+
+extract_expression <- function(df, gene_col = "gene", fc_col, group_name) {
+  df[[gene_col]] <- toupper(df[[gene_col]])
+  df %>%
+    filter(.data[[gene_col]] %in% top_genes) %>%
+    dplyr::select(gene = all_of(gene_col), log2FC = all_of(fc_col)) %>%
+    mutate(Group = group_name)
+}
+
+blood_pac_expr    <- extract_expression(blood_pac,   fc_col = "Post_avg_log2FC", group_name = "Blood_Paclitaxel")
+blood_combo_expr  <- extract_expression(blood_combo, fc_col = "Post_avg_log2FC", group_name = "Blood_Combination")
+tumor_pac_expr    <- extract_expression(tumor_pac,   fc_col = "Pre_avg_log2FC",  group_name = "Tumor_Paclitaxel")
+tumor_combo_expr  <- extract_expression(tumor_combo, fc_col = "Pre_avg_log2FC",  group_name = "Tumor_Combination")
+
+expression_all <- bind_rows(
+  blood_pac_expr, blood_combo_expr,
+  tumor_pac_expr, tumor_combo_expr
+)
+p <- ggplot(expression_all, aes(x = gene, y = log2FC, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Expression of Top 20 XGBoost Genes Across Conditions",
+    x = "Gene", y = "log2 Fold Change", fill = "Condition"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave("D:/Thesis/Proposal/Analysis/Machine Learning/Expression Matrix Gene/xgboost_top20_gene_expression_conditions.png",
+       plot = p, width = 10, height = 6, dpi = 300)
+
+# ======================================= SHAP
+# انتخاب ۲۰ ژن برتر که در داده‌های X_all_scaled وجود دارند
+top20_genes <- head(top_features$Gene, 20)
+valid_genes <- top20_genes[top20_genes %in% colnames(X_all_scaled)]
+
+# استخراج داده‌های مربوط به ۲۰ ژن معتبر
+X_top20_scaled <- X_all_scaled[, valid_genes, drop = FALSE]
+
+# ساخت فاکتور برچسب‌ها با نام‌های معتبر در R
+y_top20 <- factor(df$Label)
+levels(y_top20) <- make.names(levels(y_top20))  # تبدیل نام‌ها به نام‌های معتبر مثل non_progressive
+
+# مشاهده تعداد نمونه‌ها در هر کلاس
+print(table(y_top20))
+
+# آموزش مدل XGBoost با ۲۰ ژن برتر
+xgb_top20_model <- train(
+  x = X_top20_scaled,
+  y = y_top20,
+  method = "xgbTree",
+  trControl = trainControl(method = "cv", number = 5, classProbs = TRUE),
+  tuneGrid = xgb_model$bestTune
+)
+
+# ساخت شیء Predictor برای SHAP
+predictor_top20 <- Predictor$new(
+  model = xgb_top20_model,
+  data = X_top20_scaled,
+  y = y_top20,
+  predict.function = function(model, newdata) {
+    newdata <- as.data.frame(newdata)
+    colnames(newdata) <- make.names(colnames(newdata))
+    predict(model, newdata, type = "prob")[, "progressive"]  # اگر اسم کلاس‌ها متفاوت شد این را اصلاح کن
+  },
+  type = "prob"
+)
+
+# محاسبه SHAP برای نمونه اول
+shap <- Shapley$new(predictor_top20, x.interest = X_top20_scaled[1, , drop = FALSE])
+
+# ترسیم نمودار SHAP
+plot(shap) +
+  scale_y_discrete(labels = valid_genes) + 
+  ggtitle("SHAP Contribution per Gene (Top 20)")
+
+# آماده سازی داده‌های SHAP برای نمودار میله‌ای
+shap_df <- shap$results
+shap_df <- shap_df[order(shap_df$phi), ]
+shap_df$Gene <- factor(shap_df$feature.value, levels = shap_df$feature.value)
+
+library(ggplot2)
+shap_plot_clean <- ggplot(shap_df, aes(x = phi, y = Gene)) +
+  geom_col(fill = "steelblue") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "SHAP Contribution per Gene (Top 20)",
+    x = "SHAP Value (phi)", y = "Gene"
+  )
+
+print(shap_plot_clean)
+
+# ذخیره نمودار
+ggsave(
+  filename = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/SHAP/SHAP_plot_top20_cell1_clean.png",
+  plot = shap_plot_clean,
+  width = 10,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+# ------------------------ تحلیل SHAP برای چند سلول
+cells_to_analyze <- 1:5
+for (i in cells_to_analyze) {
+  shap <- Shapley$new(predictor_top20, x.interest = X_top20_scaled[i, , drop = FALSE])
+  
+  shap_df <- data.frame(
+    Gene = colnames(X_top20_scaled),
+    phi = shap$results$phi
+  )
+  
+  p <- ggplot(shap_df, aes(x = reorder(Gene, phi), y = phi)) +
+    geom_col(fill = "#2196F3") +
+    coord_flip() +
+    labs(
+      title = sprintf("SHAP Contribution - Cell %d", i),
+      x = "Gene",
+      y = "SHAP Value (phi)"
+    ) +
+    theme_minimal(base_size = 13)
+  
+  ggsave(sprintf("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/SHAP/xgboost_SHAP_plot_top20_cell_%d.png", i),
+         plot = p, width = 10, height = 6, dpi = 300)
+}
+# ------------------------ محاسبه SHAP برای 100 سلول اول
+# ------------------------ محاسبه SHAP برای 100 سلول اول
+N <- 100
+shap_values_list <- lapply(1:N, function(i) {
+  s <- Shapley$new(predictor_top20, x.interest = X_top20_scaled[i, , drop = FALSE])
+  s$results$phi
+})
+
+shap_matrix <- do.call(rbind, shap_values_list)
+mean_shap <- colMeans(shap_matrix)
+gene_names <- colnames(X_top20_scaled)
+shap_summary <- data.frame(Gene = gene_names, MeanSHAP = mean_shap)
+top_shap <- shap_summary[order(-abs(shap_summary$MeanSHAP)), ][1:10, ]
+p <- ggplot(top_shap, aes(x = reorder(Gene, MeanSHAP), y = MeanSHAP, fill = MeanSHAP)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient2(low = "#1565C0", mid = "white", high = "#D84315", midpoint = 0) +
+  labs(title = "Top 10 SHAP Values Across 100 Cells",
+       x = "Gene", y = "Mean SHAP Value") +
+  theme_classic()
+ggsave("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/SHAP/SHAP_mean_top10_across_cells.png",
+       plot = p, width = 10, height = 6, dpi = 300)
+print(p)
+# ------------------------ مقایسه کلاسها: progressive vs non-progressive
+N <- 100  
+progressive_idx <- which(y_top20 == "progressive")
+non_progressive_idx <- which(y_top20 == "non-progressive")
+
+prog_cells <- head(progressive_idx, N)
+nonprog_cells <- head(non_progressive_idx, N)
+
+compute_shap_mean <- function(cell_indices) {
+  shap_list <- lapply(cell_indices, function(i) {
+    s <- Shapley$new(predictor_top20, x.interest = X_top20_scaled[i, , drop = FALSE])
+    phi <- s$results$phi
+    if (!is.null(phi) && is.numeric(phi) && length(phi) > 0) {
+      return(as.data.frame(t(phi)))
+    } else {
+      message(sprintf("⚠️ Skipping cell %d due to empty or invalid SHAP results.", i))
+      return(NULL)
+    }
+  })
+  shap_list <- Filter(Negate(is.null), shap_list)
+  if (length(shap_list) == 0) {
+    stop("❌ No valid SHAP results to compute mean.")
+  }
+  shap_mat <- do.call(rbind, shap_list)
+  colMeans(shap_mat)
+}
+
+# تست با نمونه‌های بیشتر
+N_large <- 300
+nonprog_cells_large <- non_progressive_idx[1:N_large]
+mean_shap_nonprog <- compute_shap_mean(nonprog_cells_large)
+
+gene_names <- colnames(X_top20_scaled)
+names(mean_shap_prog) <- gene_names
+names(mean_shap_nonprog) <- gene_names
+
+df_shap_compare <- data.frame(
+  Gene = gene_names,
+  SHAP_progressive = mean_shap_prog,
+  SHAP_non_progressive = mean_shap_nonprog
+)
+
+df_shap_compare$SHAP_Difference <- abs(df_shap_compare$SHAP_progressive - df_shap_compare$SHAP_non_progressive)
+
+#  نمایش برترین ژن‌ها بر اساس تفاوت SHAP
+top_diff <- df_shap_compare[order(-df_shap_compare$SHAP_Difference), ][1:10, ]
+df_melted <- reshape2::melt(top_diff[, c("Gene", "SHAP_progressive", "SHAP_non_progressive")], id.vars = "Gene")
+
+p_diff <- ggplot(df_melted, aes(x = reorder(Gene, value), y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("SHAP_progressive" = "#EF5350", "SHAP_non_progressive" = "#42A5F5")) +
+  labs(title = "🔍 SHAP Comparison Between Classes (Top 10 Genes)",
+       x = "Gene", y = "Mean SHAP Value", fill = "Group") +
+  theme_classic()
+
+ggsave("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/SHAP/SHAP_class_comparison_top10.png",
+       plot = p_diff, width = 10, height = 6, dpi = 300)
+
+print(p_diff)
+write.csv(df_shap_compare,
+          file = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/SHAP/shap_comparison_progressive_vs_nonprogressive.csv",
+          row.names = FALSE)
+
+# ------------------------------------ LIMA
+library(limma)
+
+# آماده‌سازی ماتریس count و طراحی مدل
+expr_matrix <- as.matrix(filtered_counts)
+labels <- cell_labels$Label
+labels <- factor(labels, levels = c("non_progressive", "progressive"))
+
+# طراحی ماتریس مدل
+design <- model.matrix(~ labels)
+colnames(design) <- c("Intercept", "Progressive_vs_NonProg")
+cat("🧪 expr_matrix columns:", ncol(expr_matrix), "\n")
+cat("🧪 cell_labels rows  :", nrow(cell_labels), "\n")
+cat("📏 length(labels):", length(labels), "\n")
+cat("📏 nrow(design):", nrow(design), "\n")
+str(labels)
+summary(labels)
+table(labels, useNA = "ifany")
+unique(cell_labels_filtered$Label)
+table(cell_labels_filtered$Label, useNA = "ifany")
+cell_labels_filtered$Label <- gsub("-", "_", cell_labels_filtered$Label)
+labels <- factor(cell_labels_filtered$Label, levels = c("non_progressive", "progressive"))
+design <- model.matrix(~ labels)
+stopifnot(nrow(design) == length(labels))
+png("D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/voom_mean_variance_plot.png", width = 800, height = 600)
+v <- voom(expr_matrix, design, plot = TRUE)
+dev.off()
+
+# اجرای limma
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(design)
+
+# استخراج نتایج
+results <- topTable(fit, coef = "labelsprogressive", number = Inf, adjust = "BH")
+head(results)
+write.csv(results, "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/limma_DEG_results_all.csv", row.names = TRUE)
+
+topTable_results <- topTable(fit, coef = "labelsprogressive", number = 20)
+head(topTable_results)
+
+write.csv(topTable_results,
+          "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/top20_limma_DEGs.csv",
+          row.names = TRUE)
+all_degs <- topTable(fit, coef = "labelsprogressive", number = Inf)
+write.csv(all_degs,
+          "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/limma_DEG_results_all.csv",
+          row.names = TRUE)
+
+all_degs$Gene <- rownames(all_degs)
+all_degs$Significant <- ifelse(all_degs$adj.P.Val < 0.05 & abs(all_degs$logFC) > 1, "Yes", "No")
+write.csv(all_degs, file = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/all_degs_results.csv", row.names = FALSE)
+
+ggplot(all_degs, aes(x = logFC, y = -log10(adj.P.Val), color = Significant)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("No" = "gray", "Yes" = "red")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot", x = "log2 Fold Change", y = "-log10 Adjusted P-value")
+ggsave(
+  filename = "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/volcano_plot_limma.png",
+  width = 8, height = 6, dpi = 300
+)
+
+# فیلتر ژن‌های معنادار با تغییر زیاد
+filtered_degs <- subset(all_degs, adj.P.Val < 0.05 & abs(logFC) > 1)
+
+# مرتب‌سازی بر اساس مقدار P تعدیل‌شده (برای اهمیت آماری)
+filtered_degs <- filtered_degs[order(filtered_degs$adj.P.Val), ]
+
+# انتخاب 20 تای اول
+top20_limma <- head(filtered_degs, 20)
+
+# افزودن نام ژن
+top20_limma$Gene <- rownames(top20_limma)
+
+# نمایش
+print(top20_limma)
+
+top20_limma$Gene <- factor(top20_limma$Gene, levels = top20_limma$Gene[order(top20_limma$logFC)])
+top20_limma <- top20_limma[order(top20_limma$logFC), ]
+write.csv(top20_limma,
+          "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/top20_limma_logFC_ordered.csv",
+          row.names = FALSE)
+
+
+ggplot(top20_limma, aes(x = reorder(Gene, logFC), y = logFC, fill = logFC > 0)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "#2166AC", "FALSE" = "#B2182B"),
+    labels = c("Downregulated", "Upregulated")
+  ) +
+  labs(
+    title = "Top 20 Differentially Expressed Genes",
+    x = "Gene",
+    y = "log2 Fold Change",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "top",
+    axis.text.y = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(size = 11),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  )
+ggsave(
+  "D:/Thesis/Proposal/Analysis/Machine Learning/Results/XGBoost/LIMMA/limma_top20_for_paper.png",
+  width = 7,
+  height = 5,
+  dpi = 600,  # برای ژورنال‌های با کیفیت بالا
+  bg = "white"
+)
