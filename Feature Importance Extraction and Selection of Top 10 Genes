@@ -1,4 +1,4 @@
-# 1.  Accuracy & Model
+# 1. Accuracy & Model
 
 import os
 import numpy as np
@@ -19,21 +19,21 @@ from tensorflow.keras import backend as K
 
 from xgboost import XGBClassifier
 
-# 📁 مسیر ذخیره‌سازی
+# Output directory path
 output_dir = "/content/drive/MyDrive/GXB_MLP_Improved"
 os.makedirs(output_dir, exist_ok=True)
 
-# 📄 بارگذاری داده
+# Load data
 df = pd.read_csv(f"{output_dir}/data_top80-200f.csv")
 X = df.drop(columns=["Label"]).values
 y = (df["Label"] == "progressive").astype(int).values
 feature_names = df.drop(columns=["Label"]).columns
 
-# ⚖️ نرمال‌سازی
+# ⚖Normalization
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# 🎯 focal loss
+# Focal loss
 def focal_loss(gamma=2., alpha=0.25):
     def loss(y_true, y_pred):
         y_pred = K.clip(y_pred, K.epsilon(), 1. - K.epsilon())
@@ -43,29 +43,29 @@ def focal_loss(gamma=2., alpha=0.25):
         return K.mean(weight * cross_entropy)
     return loss
 
-# تابع بهترین آستانه
+# Best threshold function
 def best_threshold(y_true, y_prob):
     thresholds = np.arange(0.1, 0.9, 0.01)
     accs = [accuracy_score(y_true, y_prob > t) for t in thresholds]
     best_idx = np.argmax(accs)
     return thresholds[best_idx], accs[best_idx]
 
-# 🔁 Cross-validation
+# Cross-validation
 kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 mlp_auc, mlp_acc, xgb_auc, xgb_acc, combined_accs = [], [], [], [], []
 best_auc_mlp, best_auc_xgb = 0, 0
 best_model_mlp, best_model_xgb = None, None
 
 for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled, y), 1):
-    print(f"\n🔁 Fold {fold}")
+    print(f"\nFold {fold}")
     X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
 
-    # ⚖️ وزن کلاس‌ها
+    # ⚖️ Class weights
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(enumerate(class_weights))
 
-    # ✅ مدل MLP بهینه‌شده
+    # Optimized MLP model
     K.clear_session()
     model = Sequential([
         Input(shape=(X.shape[1],)),
@@ -89,7 +89,7 @@ for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled, y), 1):
     model.fit(X_train, y_train, epochs=100, batch_size=32, validation_split=0.2,
               verbose=0, callbacks=[es, lr_reducer], class_weight=class_weight_dict)
 
-    # پیش‌بینی MLP
+    # MLP predictions
     y_prob_mlp = model.predict(X_test).ravel()
     best_thresh, best_acc = best_threshold(y_test, y_prob_mlp)
     y_pred_mlp = (y_prob_mlp > best_thresh).astype(int)
@@ -102,7 +102,7 @@ for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled, y), 1):
         best_auc_mlp = auc_mlp
         best_model_mlp = model
 
-    # ✅ XGBoost بهینه‌شده
+    # Optimized XGBoost model
     pos_weight = class_weight_dict[1] / class_weight_dict[0]
     xgb = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.03,
                         scale_pos_weight=pos_weight, subsample=0.8, colsample_bytree=0.8,
@@ -120,19 +120,19 @@ for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled, y), 1):
         best_auc_xgb = auc_xgb
         best_model_xgb = xgb
 
-    # ✅ ترکیب مدل‌ها (Ensemble)
+    # Model ensembling
     combined_prob = 0.6 * y_prob_mlp + 0.4 * y_prob_xgb
     combined_pred = (combined_prob > best_thresh).astype(int)
     combined_acc = accuracy_score(y_test, combined_pred)
     combined_accs.append(combined_acc)
-    print(f"✅ Combined Accuracy: {combined_acc:.4f}")
+    print(f"Combined Accuracy: {combined_acc:.4f}")
 
-# 💾 ذخیره مدل‌ها
+# Save models
 best_model_mlp.save(f"{output_dir}/best_mlp_model.h5")
 joblib.dump(best_model_xgb, f"{output_dir}/best_xgb_model.pkl")
 joblib.dump(scaler, f"{output_dir}/scaler.pkl")
 
-# 📊 نتایج
+# Results
 results_df = pd.DataFrame({
     "Fold": list(range(1, 6)),
     "MLP AUC": mlp_auc,
@@ -149,7 +149,7 @@ results_df.loc["Mean"] = ["Mean",
                           np.mean(combined_accs)]
 results_df.to_csv(f"{output_dir}/fold_comparison_improved.csv", index=False)
 
-# 📈 نمودار AUC
+# AUC Plot
 plt.figure(figsize=(8, 5))
 plt.plot(range(1, 6), mlp_auc, marker='o', label='MLP AUC')
 plt.plot(range(1, 6), xgb_auc, marker='s', label='XGBoost AUC')
