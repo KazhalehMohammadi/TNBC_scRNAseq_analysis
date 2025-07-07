@@ -61,7 +61,7 @@ for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled, y), 1):
     X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
 
-    # ⚖️ Class weights
+    # Class weights
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(enumerate(class_weights))
 
