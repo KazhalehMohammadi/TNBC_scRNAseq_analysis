@@ -1,0 +1,325 @@
+library(Seurat)
+library(dplyr)
+library(readr)
+library(e1071)
+library(caret)
+library(rpart) 
+library(ggplot2)
+library(rpart.plot)
+library(iml)
+library(data.table)
+library(ggpubr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(httr)
+library(jsonlite)
+library(readxl)
+library(janitor)
+library(reshape2)
+library(randomForest)
+library(reshape2)
+library(xgboost)
+library(Matrix)
+library(openxlsx)
+library(limma)
+library(edgeR)
+library(ggrepel)
+
+# ===============================================================
+
+file_path <- "D:\\Thesis\\Proposal\\Analysis\\TOP-BIOMARKERS\\Results\\Blood_Pac&Atezo\\Top100_Biomarkers_WeightedScore.csv"
+data <- read.csv(file_path, header = TRUE)
+d <- data$gene
+
+data_dir <- "D:/Thesis/Proposal/Thesis_Data/GSE169246/files"
+
+names <- c("Pre_P001_b","Pre_P002_b","Pre_P004_b", "Pre_P005_b", "Pre_P007_b", "Pre_P010_b", 
+           "Pre_P012_b", "Pre_P014_b", "Pre_P016_b", "Pre_P017_b","Pre_P019_b"
+)  
+
+sample_dirs <- list.dirs(data_dir, recursive = TRUE, full.names = TRUE)
+sample_dirs <- sample_dirs[basename(sample_dirs) %in% names]
+
+seurat_list <- list()
+for (dir in sample_dirs) {
+  sample_name <- basename(dir)
+  counts <- Read10X(data.dir = dir)
+  colnames(counts) <- paste(sample_name, colnames(counts), sep = "-")
+  seurat_obj <- CreateSeuratObject(counts = counts, project = sample_name)
+  seurat_list[[sample_name]] <- seurat_obj@assays$RNA@counts
+}
+
+combined_counts <- do.call(cbind, seurat_list)
+filtered_counts <- combined_counts[rownames(combined_counts) %in% d, ]
+
+saveRDS(filtered_counts, "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\filtered_counts_matrix.rds")
+filtered_counts <- readRDS("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\filtered_counts_matrix.rds")
+
+cell_names <- colnames(combined_counts)
+sample_ids <- sapply(strsplit(cell_names, "-"), `[`, 1)
+str(cell_names)
+
+
+unique_samples <- unique(sample_ids)
+cell_labels <- data.frame(Cell = character(), Label = character(), stringsAsFactors = FALSE)
+
+valid_labels <- c("progressive", "non-progressive")
+for (sample in unique_samples) {
+  repeat {
+    label <- readline(prompt = paste0("Enter label for sample '", sample, "' (progressive / non-progressive): "))
+    label <- trimws(tolower(label))  
+    if (label %in% valid_labels) break
+    cat("Invalid input. Please enter only 'progressive' or 'non-progressive'.\n")
+  }
+  cells <- cell_names[sample_ids == sample]
+  sample_df <- data.frame(Cell = cells, Label = label, stringsAsFactors = FALSE)
+  cell_labels <- rbind(cell_labels, sample_df)
+}
+
+saveRDS(cell_labels,
+        "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\cell_labels.rds")
+cell_labels <- readRDS("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\cell_labels.rds")
+
+write.csv(cell_labels, "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\cell_labels.csv", row.names = FALSE)
+fwrite(cell_labels,
+       file = "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\cell_labels_fast.csv",
+       row.names = FALSE)
+
+# ============================================ Classification with Random Forest
+cell_labels <- readRDS("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\cell_labels.rds")
+seurat_list <- list()
+for (dir in sample_dirs) {
+  sample_name <- basename(dir)
+  counts <- Read10X(data.dir = dir)
+  colnames(counts) <- paste(sample_name, colnames(counts), sep = "-")
+  seurat_obj <- CreateSeuratObject(counts = counts, project = sample_name)
+  seurat_list[[sample_name]] <- seurat_obj@assays$RNA@counts
+}
+combined_counts <- do.call(cbind, seurat_list)
+
+# (Top 100)
+filtered_counts <- combined_counts[rownames(combined_counts) %in% d, ]
+saveRDS(filtered_counts, "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\filtered_counts_matrix.rds")
+filtered_counts <- readRDS("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\filtered_counts_matrix.rds")
+
+X <- as.data.frame(t(filtered_counts))  # rows = cells
+X$Cell <- rownames(X)
+df <- merge(X, cell_labels, by = "Cell")
+df$Label <- trimws(tolower(df$Label))
+df <- df[df$Label %in% c("progressive", "non-progressive"), ]
+print(table(df$Label))
+stopifnot(length(unique(df$Label)) > 1)
+
+X <- df[, !(names(df) %in% c("Cell", "Label"))]
+X <- data.frame(lapply(X, as.numeric))
+y <- as.factor(df$Label)
+
+preProc <- preProcess(X, method = c("center", "scale"))
+X_scaled <- predict(preProc, X)
+nzv <- nearZeroVar(X_scaled)
+X_filtered <- X_scaled[, -nzv]
+
+set.seed(123)
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+X_train <- X_filtered[train_idx, ]
+X_test  <- X_filtered[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+
+rf_model <- randomForest(x = X_train, y = y_train, ntree = 500, importance = TRUE)
+pred <- predict(rf_model, X_test)
+cm <- confusionMatrix(pred, y_test, positive = "progressive")
+print(cm)
+# ================================
+X_labeled <- X_filtered
+X_labeled$Label <- y
+X_labeled$Cell <- rownames(X_filtered)
+X_labeled <- X_labeled[, c("Cell", "Label", setdiff(colnames(X_labeled), c("Cell", "Label")))]
+write.csv(X_labeled, "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\rf_results.csv", row.names = FALSE)
+
+# ===========================================
+saveRDS(rf_model, file = "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\rf_model.rds")
+
+save(rf_model, X_filtered, y, cm, file = "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RF_model_outputs.RData")
+load("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RF_model_outputs.RData")
+
+save.image("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RF_final_workspace.RData")
+load("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RF_final_workspace.RData")
+
+sink("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\randomforest_metrics.txt")
+cat("\n Random Forest Performance Metrics:\n")
+cat("Accuracy:", round(cm$overall["Accuracy"], 3), "\n")
+cat("Sensitivity (Recall):", round(cm$byClass["Sensitivity"], 3), "\n")
+cat("Specificity:", round(cm$byClass["Specificity"], 3), "\n")
+cat("Precision:", round(cm$byClass["Precision"], 3), "\n")
+cat("F1-score:", round(cm$byClass["F1"], 3), "\n")
+sink()
+metrics <- readLines("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\randomforest_metrics.txt")
+cat(metrics, sep = "\n")
+# ===================================================
+importance_vals <- importance(rf_model)
+importance_df <- data.frame(
+  Gene = rownames(importance_vals),
+  Importance = importance_vals[, "MeanDecreaseGini"],
+  stringsAsFactors = FALSE
+)
+
+# ====================================
+write.csv(importance_df, "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\randomforest_gene_importance.csv", row.names = FALSE)
+
+# ===========================================
+top20 <- head(importance_df[order(-importance_df$Importance), ], 20)
+print(top20$Gene)
+
+top20_plot <- ggplot(top20, aes(x = reorder(Gene, Importance), y = Importance, fill = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_gradient(low = "#FFDDC1", high = "#FF5733") +
+  labs(title = "Top 20 Important Genes (Random Forest)",
+       x = "Gene", y = "Importance", fill = "Importance") +
+  theme_classic()
+ggsave("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\randomforest_top20_rf_gene_importance.png",
+       plot = top20_plot,
+       width = 10, height = 6, dpi = 300)
+
+print(top20_plot)
+write.xlsx(top20,
+           file = "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\randomforest_top20_rf_genes.xlsx",
+           rowNames = FALSE)
+# ----------------------------------------- RandomForest Final Biomarker Panel
+table(df$Label)
+prop.table(table(df$Label))
+
+# =================================
+importance_vals <- importance(rf_model)
+importance_df <- data.frame(
+  Gene = rownames(importance_vals),
+  Importance = importance_vals[, "MeanDecreaseGini"],
+  stringsAsFactors = FALSE
+)
+
+# =====================================
+top20 <- head(importance_df[order(-importance_df$Importance), ], 20)
+top20$Gene_lower <- tolower(top20$Gene)
+
+# ==============================
+data <- read.csv("D:/Thesis/Proposal/Analysis/ML/ML_Blood_Pacli&Atezo/Top100_Biomarkers_WeightedScore.csv")
+data$gene_lower <- tolower(data$gene)
+
+top20_with_cluster <- merge(top20, data, by.x = "Gene_lower", by.y = "gene_lower")
+
+# ==================================
+print(top20_with_cluster[, c("Gene", "Importance", "cluster_id", "evidence_score", "Max_Membership")], row.names = FALSE)
+write.csv(top20_with_cluster,
+          "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RandomForest_top20_gene_with_cluster_info.csv",
+          row.names = FALSE)
+
+# ----------------------------------------- Visualize Gene Importance (Top 20)
+
+p1 <- ggplot(top20_with_cluster, aes(x = reorder(Gene, Importance), y = Importance, fill = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_gradient(low = "#FFDDC1", high = "#FF5733") +
+  labs(title = "Top 20 Important Genes (Random Forest)",
+       x = "Gene", y = "Importance", fill = "Importance") +
+  theme_classic() +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p1)
+ggsave("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RandomForest_top20_gene_importance_colored_rf.png",
+       plot = p1, width = 10, height = 6, dpi = 300)
+
+# ----------------------------------------- 
+n_genes_used <- ncol(X_filtered)
+cat("=number of genes used in  Random Forest:", n_genes_used, "\n")
+used_genes <- colnames(X_filtered)
+write.csv(used_genes,
+          "D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RandomForest_used_genes_rf.csv",
+          row.names = FALSE)
+
+# ----------------------------------------- Cluster-wise Importance Summary
+
+cluster_importance <- top20_with_cluster %>%
+  dplyr::group_by(cluster_id) %>%
+  dplyr::summarise(
+    n_genes = dplyr::n(),
+    total_importance = sum(Importance),
+    mean_importance = mean(Importance),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(total_importance))
+
+print(cluster_importance)
+
+# ================================
+p2 <- ggplot(cluster_importance, aes(x = reorder(cluster_id, total_importance), y = total_importance, fill = cluster_id)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Total Importance by Cluster (Top 20 Genes - RF)",
+       x = "Cluster", y = "Total Importance") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p2)
+ggsave("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RandomForest_cluster_total_importance_rf_top20.png",
+       plot = p2, width = 10, height = 6, dpi = 300)
+
+# ============================= RandomForest KEGG-GO
+
+gene_symbols <- top20$Gene
+entrez_ids <- bitr(gene_symbols,
+                   fromType = "SYMBOL",
+                   toType = "ENTREZID",
+                   OrgDb = org.Hs.eg.db)
+go_enrich <- enrichGO(gene = entrez_ids$ENTREZID,
+                      OrgDb = org.Hs.eg.db,
+                      ont = "BP",  # Biological Process
+                      pvalueCutoff = 0.05,
+                      readable = TRUE)
+#install.packages("DOSE")
+library(DOSE)  # برای setReadable
+
+kegg_enrich <- enrichKEGG(gene = entrez_ids$ENTREZID,
+                          organism = "hsa",
+                          pvalueCutoff = 0.05)
+
+# convert Entrez IDs به SYMBOLs
+kegg_enrich <- setReadable(kegg_enrich, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+
+head(summary(go_enrich))
+head(summary(kegg_enrich))
+
+p_go <- cnetplot(go_enrich,
+                 showCategory = 10,
+                 circular = FALSE,
+                 color.params = list(edge = TRUE))
+
+print(p_go)
+ggsave("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RandomForest_GO_network_plot_top20_rf.png",
+       plot = p_go,
+       width = 12, height = 12,
+       dpi = 300,
+       bg = "white")
+
+p_kegg <- cnetplot(kegg_enrich,
+                   showCategory = 10,
+                   circular = FALSE,
+                   color.params = list(edge = TRUE))
+
+print(p_kegg)
+
+ggsave("D:\\Thesis\\Proposal\\Analysis\\ML\\ML_Blood_Pacli&Atezo\\RF\\RandomForest_KEGG_network_plot_top20_rf.png",
+       plot = p_kegg,
+       width = 12, height = 9,
+       dpi = 300,
+       bg = "white")
+
